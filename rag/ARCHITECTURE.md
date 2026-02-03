@@ -2,6 +2,10 @@
 
 This document outlines the architecture of the Somnia RAG (Retrieval-Augmented Generation) agent. This system is designed to provide accurate, citation-backed developer support for the Somnia ecosystem. It is engineered for determinism, debuggability, and resilience in the face of common failure modes.
 
+A key architectural constraint is deterministic execution: given the same input state and retrieved context, the agent must follow the same execution path and termination behavior. This property is critical for debugging, observability, and downstream API integration.
+
+Throughout this document, ‘agent’ refers to a LangGraph-based state machine composed of deterministic nodes operating over a shared AgentState.
+
 The core of the agent is a state machine implemented using LangGraph. This choice was deliberate. While linear chains are simpler, they lack the flexibility required for a robust agent. LangGraph allows us to define a cyclical graph where the agent can loop, retry operations, and gracefully exit based on explicit conditions. This is critical for handling the unpredictable nature of user queries and external dependencies like LLM APIs and vector stores.
 
 Our primary design goals are accuracy, safety, and observability. We prioritize providing grounded answers over speculative ones. Non-goals include open-ended conversational abilities or proactive task execution beyond answering developer questions based on provided documentation.
@@ -53,7 +57,7 @@ The lifecycle of a single user query is a controlled loop within the LangGraph s
 
 Aggressive context management is non-negotiable for a production RAG system. The LLM's context window is a finite and expensive resource. We employ several safety layers to manage it.
 
-First, we use a message trimming mechanism. Before each LLM call, we calculate the expected token count of the `messages` list. If it exceeds a predefined safety threshold (e.g., 80% of the model's maximum context), we begin trimming messages. Trimming starts from the second message in the history (to preserve the initial system prompt) and works forward, removing the oldest user-AI interactions first. This preserves the most recent and relevant turns of the conversation.
+First, we use a message trimming mechanism. Before each LLM call, we calculate the expected token count of the `messages` list. If it exceeds a predefined safety threshold (e.g., 80% of the model's maximum context), we begin trimming messages. The system prompt is injected after trimming user and tool messages. This ensures that safety and behavioral constraints are never removed, even under aggressive context pressure. This preserves the most recent and relevant turns of the conversation.
 
 Second, we have a hard guardrail. If, even after trimming, the context still exceeds the model's limit, we do not invoke the LLM. Instead, the agent exits immediately with the `exit_reason` set to `MAX_CONTEXT_REACHED`. This prevents API errors and ensures we fail safely and predictably. Avoiding an unsafe LLM call is always preferable to risking a crash or receiving a truncated, nonsensical response.
 
@@ -69,6 +73,8 @@ Known exit reasons include:
 
 Explicit exit reasons are invaluable for debugging and monitoring. An increase in `MAX_TURNS_REACHED` might flag an issue with the retrieval prompt or the quality of the documents. A spike in `RATE_LIMITED` indicates a need to adjust API usage patterns. This structured approach to failure makes the system transparent and easier to maintain.
 
+Exit reasons form a stable contract between the agent and downstream clients, allowing UI layers, APIs, and DevRel tooling to react programmatically rather than parsing natural language output.
+
 ## Citations & Grounding
 
 The agent's primary directive is to act as a faithful interface to the Somnia documentation. It is explicitly instructed to ground its answers in the documents retrieved by the tool.
@@ -76,6 +82,8 @@ The agent's primary directive is to act as a faithful interface to the Somnia do
 We treat the retrieved context as the source of truth for a given query. The system prompt heavily penalizes speculation. If the answer is not present in the retrieved documents, the agent is designed to state that it does not have the information, rather than attempting to guess. This discipline is essential for building trust with developers, who rely on the accuracy of the provided information.
 
 This refusal to speculate is a deliberate design choice. While a more conversational AI might try to provide a "helpful" but unverified answer, our RAG system prioritizes trustworthiness and reliability above all else. Every piece of information provided should be traceable back to a specific document.
+
+The LLM is instructed to treat retrieved documents as authoritative context and to decline answers when relevant context is absent, rather than extrapolating from prior knowledge.
 
 ## Extensibility
 
@@ -98,3 +106,5 @@ We have also deferred implementing sophisticated caching and tool-retry logic. C
 Finally, the system currently uses a single, monolithic retriever. We plan to evolve this into a multi-retriever system, where the agent can choose the most appropriate knowledge base to query based on the user's question (e.g., routing to different vector stores for different Somnia services).
 
 These features were intentionally deferred to prioritize getting the core state management, safety, and grounding logic right first. The current architecture provides a solid foundation upon which these improvements can now be built.
+
+Premature optimization was intentionally avoided in favor of correctness, debuggability, and explicit failure handling, which are significantly harder to retrofit later.
