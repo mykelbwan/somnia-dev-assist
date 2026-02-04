@@ -39,27 +39,41 @@ By maintaining this explicit state, we can easily add new fields to track more c
 
 ## Execution Flow
 
-The lifecycle of a single user query is a controlled loop within the LangGraph state machine.
+The lifecycle of a single user query is a controlled loop within the LangGraph state machine. The agent can be executed in a blocking `invoke` mode or a real-time `astream_events` mode.
 
-1.  **Input:** A user query is received and used to initialize the `AgentState`, populating the `messages` list with a `HumanMessage`.
+1.  **Input:** A user query is received and used to initialize the `AgentState`.
+2.  **LLM Invocation:** The state is passed to the LLM node. If a cached response exists, it is returned immediately. Otherwise, the model is invoked (optionally streaming tokens).
+3.  **Conditional Edge (Tool Use):** If the LLM requests a tool (e.g., retrieval), the graph routes to the Tool Node.
+4.  **Tool Execution:** The Tool Node executes document retrieval, utilizing caching and retries as necessary.
+5.  **Looping:** The results are passed back to the LLM for synthesis.
+6.  **Termination:** The loop concludes when a final answer is generated or a safety limit is hit. The `exit_reason` is set in the final state.
 
-2.  **LLM Invocation:** The state is passed to the LLM node. The model is prompted to either answer the user's question directly or to use the provided retriever tool if it needs more information.
+## Streaming & Event Pipeline
 
-3.  **Conditional Edge (Tool Use):** The graph's primary conditional edge checks the most recent `AIMessage`. If it contains a `tool_calls` request, the state is routed to the Tool Node. Otherwise, if it's a direct answer, the state is routed to the termination point.
+To support interactive user experiences, the agent implements an event-driven streaming pipeline using the `astream_events` protocol.
 
-4.  **Tool Execution:** The Tool Node executes the requested retrieval, fetching relevant documents from the vector store. The results are packaged into a `ToolMessage` and appended to the `messages` list in the state.
-
-5.  **Looping:** The state is passed back to the LLM node. The model now has the user's query, its previous thought process (the tool call request), and the retrieved documents. It uses this context to synthesize a grounded answer.
-
-6.  **Termination:** The loop continues until the LLM provides an answer without requesting further tool use, or a safety limit (like `max_turns`) is hit. The `exit_reason` is set, and the final state is returned. This controlled loop prevents runaway execution and ensures every query concludes deterministically.
+-   **Event Emission:** During execution, the graph emits a sequence of standard events:
+    -   `on_chat_model_stream`: Real-time token delivery for responsive UI.
+    -   `on_tool_start/end`: Observability into the retrieval process.
+    -   `on_chain_end`: Delivery of the definitive final `AgentState`.
+-   **Caching and Streaming Interplay:** An intentional architectural trade-off is made for performance: **LLM cache hits do not stream tokens**. When a result is retrieved from the cache, the agent bypasses the incremental generation phase and proceeds directly to emitting the final state. This ensures that repeated queries are served with minimal latency while maintaining execution determinism.
+-   **State as Source of Truth:** Regardless of the streaming events emitted, the final `AgentState` remains the single authoritative source of truth for the completion of a request and the final answer.
 
 ## Context Management & Safety
 
 Aggressive context management is non-negotiable for a production RAG system. The LLM's context window is a finite and expensive resource. We employ several safety layers to manage it.
 
-First, we use a message trimming mechanism. Before each LLM call, we calculate the expected token count of the `messages` list. If it exceeds a predefined safety threshold (e.g., 80% of the model's maximum context), we begin trimming messages. The system prompt is injected after trimming user and tool messages. This ensures that safety and behavioral constraints are never removed, even under aggressive context pressure. This preserves the most recent and relevant turns of the conversation.
+First, we use a message trimming mechanism. Before each LLM call, we calculate the expected character count of the `messages` list. If it exceeds `MAX_CONTEXT_CHARS` (12,000), we begin trimming messages. The system prompt is injected after trimming user and tool messages. This ensures that safety and behavioral constraints are never removed, even under aggressive context pressure. This preserves the most recent and relevant turns of the conversation.
 
-Second, we have a hard guardrail. If, even after trimming, the context still exceeds the model's limit, we do not invoke the LLM. Instead, the agent exits immediately with the `exit_reason` set to `MAX_CONTEXT_REACHED`. This prevents API errors and ensures we fail safely and predictably. Avoiding an unsafe LLM call is always preferable to risking a crash or receiving a truncated, nonsensical response.
+Second, we have a hard guardrail. If, even after trimming, the context still exceeds the model's limit, we do not invoke the LLM. Instead, the agent exits immediately with the `exit_reason` set to `MAX_CONTEXT_REACHED`. This prevents API errors and ensures we fail safely and predictably.
+
+## Caching & Reliability
+
+The agent incorporates production-grade caching and retry logic to improve latency, reduce costs, and enhance resilience.
+
+-   **Deterministic Caching:** Both retrieval results and LLM responses are cached using an in-memory `InMemoryCache`. Cache keys are generated via deterministic SHA-256 hashes of the request parameters (e.g., query, model, message payload). This ensures that identical requests yield consistent results and bypass expensive external calls.
+-   **Tool & LLM Retries:** To handle transient network or service failures, the agent implements automatic retries with exponential backoff and jitter. This hardening layer ensures that the agent can recover from temporary hiccups in the LLM provider or vector store API without failing the entire reasoning turn.
+-   **Abstraction for Scale:** The caching layer is designed with a clean `BaseCache` interface, allowing for future seamless replacement of the in-memory store with Redis or a disk-based solution as the system scales.
 
 ## Failure Modes & Exit Reasons
 
@@ -99,12 +113,13 @@ Because the state and execution are decoupled from the presentation layer, the c
 
 This architecture represents a set of deliberate trade-offs aimed at building a robust and maintainable system.
 
-The current implementation is not fully streaming; it waits for the complete LLM response at each step. This simplifies state management but increases perceived latency. A future improvement is to enable streaming from the LLM and tool nodes, which would provide a more responsive user experience.
+The current implementation supports streaming via `astream_events`, but caching non-streaming LLM calls presents a trade-off: cache hits bypass token-by-token streaming events to ensure deterministic and fast responses.
 
-We have also deferred implementing sophisticated caching and tool-retry logic. Caching LLM calls and retrieval results could significantly reduce costs and latency for repeated queries. A more robust tool node would include automatic retries with exponential backoff for transient network errors.
+While we have implemented in-memory caching and basic tool-retries, further improvements could include:
+-   **Persistent Caching:** Migrating from in-memory to Redis or disk-based caching for persistence across restarts.
+-   **Multi-Retriever System:** Evolving the single retriever into a multi-retriever system that can route queries to different specialized knowledge bases.
+-   **Advanced Context Trimming:** Moving from character-based trimming to token-based trimming for even more precise context window management.
 
-Finally, the system currently uses a single, monolithic retriever. We plan to evolve this into a multi-retriever system, where the agent can choose the most appropriate knowledge base to query based on the user's question (e.g., routing to different vector stores for different Somnia services).
-
-These features were intentionally deferred to prioritize getting the core state management, safety, and grounding logic right first. The current architecture provides a solid foundation upon which these improvements can now be built.
+These features were intentionally deferred or implemented as simple abstractions to prioritize getting the core state management and grounding logic right first.
 
 Premature optimization was intentionally avoided in favor of correctness, debuggability, and explicit failure handling, which are significantly harder to retrofit later.

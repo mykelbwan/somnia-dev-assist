@@ -14,7 +14,13 @@ from config import MAX_TOOL_CALL, MAX_TURNS
 from prompts import system_prompt
 from retriever import retriever
 from settings import GEMINI_API_KEY
-from utils import is_rate_limit_error, trim_messages
+from utils import (
+    InMemoryCache,
+    generate_cache_key,
+    is_rate_limit_error,
+    trim_messages,
+    with_retry,
+)
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash-lite",
@@ -22,6 +28,12 @@ llm = ChatGoogleGenerativeAI(
     temperature=0,
     streaming=True,
 ).bind_tools([retriever])
+
+# Caches are persistent across agent invocations in the same process.
+# Retrieval results are cached to save latency and costs.
+# LLM caching is used for non-streaming calls.
+retrieval_cache = InMemoryCache()
+llm_cache = InMemoryCache()
 
 ExitReason = Literal[
     "COMPLETED",
@@ -50,15 +62,17 @@ def should_continue(state: AgentState) -> bool:
     return isinstance(last, AIMessage) and bool(last.tool_calls)
 
 
-def llm_node(state: AgentState):
+async def llm_node(state: AgentState):
     if state["turns"] >= MAX_TURNS:
         return {
-            "messages": AIMessage(
-                content=(
-                    "I reached the maximum reasoning steps for this request. "
-                    "Please rephrase or ask a more specific question."
+            "messages": [
+                AIMessage(
+                    content=(
+                        "I reached the maximum reasoning steps for this request. "
+                        "Please rephrase or ask a more specific question."
+                    )
                 )
-            ),
+            ],
             "exit_reason": "MAX_TURNS_REACHED",
         }
 
@@ -68,12 +82,14 @@ def llm_node(state: AgentState):
     # Context overflow — do not call LLM
     if len(trimmed_history) < len(history):
         return {
-            "messages": AIMessage(
-                content=(
-                    "⚠️ The conversation is too long for me to answer safely. "
-                    "Please start a new question or narrow the scope."
+            "messages": [
+                AIMessage(
+                    content=(
+                        "The conversation is too long for me to answer safely. "
+                        "Please start a new question or narrow the scope."
+                    )
                 )
-            ),
+            ],
             "exit_reason": "MAX_CONTEXT_REACHED",
         }
 
@@ -87,33 +103,63 @@ def llm_node(state: AgentState):
 
     messages = [system_prompt] + trimmed_history
 
+    # Cache key based on model and full message payload.
+    # Note: Using cached responses will bypass token streaming events.
+    llm_cache_key = generate_cache_key(
+        "llm",
+        {
+            "model": "gemini-2.5-flash-lite",
+            "messages": [
+                (m.type, m.content, getattr(m, "tool_calls", None)) for m in messages
+            ],
+        },
+    )
+
+    cached_response = await llm_cache.get(llm_cache_key)
+    if cached_response:
+        return {
+            "messages": [cached_response],
+            "turns": state["turns"] + 1,
+            "exit_reason": "COMPLETED",
+        }
+
     try:
-        response = llm.invoke(messages)
+        # Automatic retry for transient failures during LLM invocation.
+        response = await with_retry(
+            lambda: llm.ainvoke(messages),
+            max_retries=2,
+            retryable_exceptions=(Exception,),
+        )
+        await llm_cache.set(llm_cache_key, response, ttl=3600)
     except Exception as e:
         if is_rate_limit_error(e) or "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
             return {
-                "messages": AIMessage(
-                    content=(
-                        "I'm temporarily rate-limited by the AI provider. "
-                        "Please wait a moment and try again."
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "I'm temporarily rate-limited by the AI provider. "
+                            "Please wait a moment and try again."
+                        )
                     )
-                ),
+                ],
                 "exit_reason": "RATE_LIMITED",
             }
         return {
-            "messages": AIMessage(
-                content="An internal error occurred while processing your request."
-            ),
+            "messages": [
+                AIMessage(
+                    content=f"An internal error occurred while processing your request: {e}"
+                )
+            ],
             "exit_reason": "LLM_ERROR",
         }
     return {
-        "messages": response,
+        "messages": [response],
         "turns": state["turns"] + 1,
         "exit_reason": "COMPLETED",
     }
 
 
-def tool_node(state: AgentState):
+async def tool_node(state: AgentState):
     """Executes tools based on the last message's tool calls."""
     if state["tool_calls"] >= MAX_TOOL_CALL:
         return {
@@ -123,7 +169,7 @@ def tool_node(state: AgentState):
                     tool_call_id="limit",
                 )
             ],
-            "exit_reason": "MAX_TOOL_CALL_REACHED",
+            "exit_reason": "MAX_TOOL_CALLS_REACHED",
         }
     last = state["messages"][-1]
     if not isinstance(last, AIMessage) or not last.tool_calls:
@@ -136,7 +182,34 @@ def tool_node(state: AgentState):
         tool_args = call["args"]
         tool_id = call["id"]
         if tool_name == "retriever":
-            result = retriever.invoke(tool_args["query"])
+            # Deterministic cache key for retrieval.
+            # Includes query and implicit retriever configuration.
+            cache_key = generate_cache_key(
+                "retriever",
+                {
+                    "query": tool_args["query"],
+                    "k": 5,
+                    "fetch_k": 20,
+                    "type": "mmr",
+                },
+            )
+
+            result = await retrieval_cache.get(cache_key)
+            if result is None:
+                try:
+                    # Tool retry logic with exponential backoff.
+                    # This ensures transient network/service errors don't fail the turn.
+                    result = await with_retry(
+                        lambda: retriever.ainvoke(tool_args["query"]),
+                        max_retries=3,
+                        retryable_exceptions=(Exception,),
+                    )
+                    # Cache successful, non-empty results to reduce future latency.
+                    if result and result != "DOCUMENTATION_SEARCH_RESULT: EMPTY":
+                        await retrieval_cache.set(cache_key, result, ttl=3600)
+                except Exception as e:
+                    result = f"Error executing tool {tool_name}: {str(e)}"
+
             if result == "DOCUMENTATION_SEARCH_RESULT: EMPTY":
                 outputs.append(
                     ToolMessage(
