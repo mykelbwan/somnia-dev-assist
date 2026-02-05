@@ -41,6 +41,28 @@ By maintaining this explicit state, we can easily add new fields to track more c
 
 The lifecycle of a single user query is a controlled loop within the LangGraph state machine. The agent can be executed in a blocking `invoke` mode or a real-time `astream_events` mode.
 
+### Dual-Mode Execution: Synchronous and Asynchronous Paths
+
+To support a wide range of integration patterns—from internal tools requiring quick, blocking responses to client-facing UIs demanding real-time updates—the agent is designed with dual synchronous (`.invoke()`) and asynchronous (`.ainvoke()` / `.astream_events()`) execution paths at the graph level.
+
+This dual-mode capability is achieved using LangGraph's `RunnableLambda` with explicitly defined `func` (for synchronous execution) and `afunc` (for asynchronous execution) for each node (e.g., `llm_node`, `tool_node`). This pattern ensures:
+
+*   **Synchronous Execution (`.invoke()`):** When the agent is invoked synchronously, LangGraph automatically dispatches calls to the `func` implementations of each node. This path uses `llm.invoke()` and `retriever.invoke()` for non-streaming, deterministic execution, suitable for environments where blocking calls are acceptable or even desired. Caching lookups and retry logic on this path are also synchronous.
+*   **Asynchronous Execution (`.ainvoke()` / `.astream_events()`):** When the agent is invoked asynchronously (including streaming), LangGraph dispatches calls to the `afunc` implementations. This path uses `await llm.ainvoke()` and `await retriever.ainvoke()` to maintain non-blocking behavior and enables the `astream_events` mechanism for real-time token and event delivery. Asynchronous caching and retry mechanisms are engaged here.
+
+This design ensures that the agent's core logic remains consistent across both modes, while the underlying I/O operations (LLM calls, tool execution, caching) are correctly handled in a blocking or non-blocking manner as appropriate for the invocation context.
+
+### Preference for Streaming in External Clients
+
+For external client-facing applications (e.g., web UIs, chat interfaces, CLI streaming output), asynchronous streaming (`.astream_events()`) is the preferred mode of interaction. This is primarily because:
+
+1.  **Responsiveness:** Streaming provides a real-time, interactive user experience by delivering LLM tokens and tool events as they are generated, rather than waiting for the entire response to be synthesized.
+2.  **Perceived Performance:** Users perceive the application as faster and more responsive when they see incremental progress, even if the total processing time is similar.
+3.  **Non-Blocking I/O:** Asynchronous execution prevents blocking of the main application thread, crucial for scalable web servers and interactive UIs that need to handle multiple concurrent requests without degradation in performance.
+4.  **Observability:** The event-driven pipeline offers granular insight into the agent's internal workings (e.g., tool calls, cache hits, intermediate thoughts), which can be surfaced to users for transparency and debugging.
+
+While synchronous execution is fully supported and valuable for specific internal use cases (e.g., batch processing, unit testing, or simple script integrations), streaming is highly recommended for any scenario where user interaction or application responsiveness is critical.
+
 1.  **Input:** A user query is received and used to initialize the `AgentState`.
 2.  **LLM Invocation:** The state is passed to the LLM node. If a cached response exists, it is returned immediately. Otherwise, the model is invoked (optionally streaming tokens).
 3.  **Conditional Edge (Tool Use):** If the LLM requests a tool (e.g., retrieval), the graph routes to the Tool Node.
@@ -50,13 +72,20 @@ The lifecycle of a single user query is a controlled loop within the LangGraph s
 
 ## Streaming & Event Pipeline
 
-To support interactive user experiences, the agent implements an event-driven streaming pipeline using the `astream_events` protocol.
+To support interactive user experiences, the agent implements a unified event-driven streaming pipeline using the `astream_events` protocol. This pipeline ensures that consumers receive a consistent stream of information, regardless of whether the LLM response is generated live or served from a cache.
 
--   **Event Emission:** During execution, the graph emits a sequence of standard events:
-    -   `on_chat_model_stream`: Real-time token delivery for responsive UI.
+-   **Event Emission:** During execution, the graph emits a sequence of events:
+    -   `on_chat_model_stream`: Real-time token delivery when invoking the LLM live.
+    -   `on_custom_event(name="cached_response")`: A single event containing the full assistant message when a response is served from the cache.
     -   `on_tool_start/end`: Observability into the retrieval process.
     -   `on_chain_end`: Delivery of the definitive final `AgentState`.
--   **Caching and Streaming Interplay:** An intentional architectural trade-off is made for performance: **LLM cache hits do not stream tokens**. When a result is retrieved from the cache, the agent bypasses the incremental generation phase and proceeds directly to emitting the final state. This ensures that repeated queries are served with minimal latency while maintaining execution determinism.
+
+-   **Caching and Streaming Interplay:** An intentional architectural trade-off is made to balance performance, cost, and user experience:
+    -   **Live Invocations:** When the LLM is called, tokens are streamed incrementally via `on_chat_model_stream` for a responsive UI.
+    -   **Cached Invocations:** To avoid the latency and cost of re-invoking the LLM, cached responses are delivered in a single `cached_response` event. This avoids simulating token-by-token streaming, which would be inefficient and misleading.
+
+This dual-path approach provides the responsiveness of live streaming with the efficiency of caching, all while presenting a unified event structure to the client.
+
 -   **State as Source of Truth:** Regardless of the streaming events emitted, the final `AgentState` remains the single authoritative source of truth for the completion of a request and the final answer.
 
 ## Context Management & Safety
@@ -111,15 +140,24 @@ Because the state and execution are decoupled from the presentation layer, the c
 
 ## Trade-offs & Future Improvements
 
+
+
 This architecture represents a set of deliberate trade-offs aimed at building a robust and maintainable system.
 
-The current implementation supports streaming via `astream_events`, but caching non-streaming LLM calls presents a trade-off: cache hits bypass token-by-token streaming events to ensure deterministic and fast responses.
+
 
 While we have implemented in-memory caching and basic tool-retries, further improvements could include:
+
 -   **Persistent Caching:** Migrating from in-memory to Redis or disk-based caching for persistence across restarts.
+
 -   **Multi-Retriever System:** Evolving the single retriever into a multi-retriever system that can route queries to different specialized knowledge bases.
+
 -   **Advanced Context Trimming:** Moving from character-based trimming to token-based trimming for even more precise context window management.
 
+
+
 These features were intentionally deferred or implemented as simple abstractions to prioritize getting the core state management and grounding logic right first.
+
+
 
 Premature optimization was intentionally avoided in favor of correctness, debuggability, and explicit failure handling, which are significantly harder to retrofit later.

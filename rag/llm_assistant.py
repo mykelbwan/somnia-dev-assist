@@ -33,7 +33,7 @@ async def stream_agent_events(
         "exit_reason": input_state.get("exit_reason", None),
     }
 
-    async for event in agent.astream_events(typed_state, version="v1"):
+    async for event in agent.astream_events(typed_state, version="v2"):
         kind = event["event"]
 
         # Stream tokens from the chat model
@@ -65,20 +65,23 @@ async def stream_agent_events(
             }
 
         # Capture the final state of the graph
-        elif kind == "on_chain_end":
-            # The top-level chain end event contains the final state.
-            # In LangGraph, the output of the compiled graph is the final AgentState.
-            output = event["data"].get("output")
-            if output and isinstance(output, dict) and "exit_reason" in output:
-                # Check if it's the root runnable (no parent_ids in v1 usually means it's top-level)
-                # Or just yield it, the consumer can take the last one.
-                yield {"type": "final_state", "state": output}
-                
+        elif kind == "on_chain_end" and event["name"] == "LangGraph":
+            # The top-level chain end event in v2 contains the final state.
+            yield {"type": "final_state", "state": event["data"]["output"]}
+
         elif kind == "on_chat_model_start":
             yield {"type": "message_start"}
 
         elif kind == "on_chat_model_end":
             yield {"type": "message_end"}
+
+        # Handle custom events (e.g., cached responses)
+        elif kind == "on_custom_event":
+            if event["name"] == "cached_response":
+                yield {
+                    "type": "cached_response",
+                    "content": event["data"].get("content", ""),
+                }
 
 
 async def stream_agent(q: str) -> AsyncGenerator[Dict[str, Any], None]:

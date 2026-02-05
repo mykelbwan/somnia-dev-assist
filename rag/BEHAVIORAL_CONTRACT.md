@@ -79,7 +79,9 @@ To improve performance and reliability, the agent implements several production-
 
 -   **Retrieval Caching:** Successful retrieval results are cached in-memory, keyed by a deterministic hash of the query and retriever configuration. This reduces latency and prevents redundant vector store queries. Empty results are not cached.
 -   **LLM Response Caching:** Non-streaming LLM responses are cached based on the model name and the full message payload. This ensures consistent responses for identical inputs and reduces API costs.
--   **Note on Streaming & Caching:** Using cached LLM responses bypasses the real-time token generation process. While the final state remains consistent, intermediate `on_llm_stream` events will not be emitted for cache hits.
+-   **Note on Streaming & Caching:** To provide a consistent experience, the streaming behavior adapts to the source of the response:
+    -   **Live LLM calls** stream tokens incrementally via `on_chat_model_stream` events.
+    -   **Cached LLM responses** emit a single `cached_response` event containing the full message content. This avoids re-running the LLM while still delivering the answer to streaming consumers.
 -   **Automatic Tool Retries:** The agent performs automatic retries for transient failures (e.g., network timeouts, 5xx errors) encountered during tool execution or LLM calls.
     -   **Strategy:** Exponential backoff with jitter.
     -   **Limit:** Maximum of 3 retries for tools and 2 retries for LLM calls.
@@ -87,15 +89,18 @@ To improve performance and reliability, the agent implements several production-
 
 ## 9. Streaming Behavior
 
-The agent supports real-time event streaming via LangGraph's `astream_events` (v2) protocol. This allows clients to observe the agent's reasoning process as it happens.
+The agent supports real-time event streaming via LangGraph's `astream_events` protocol. This allows clients to observe the agent's reasoning process as it happens and receive the final answer, regardless of whether it comes from a live LLM call or a cache.
 
 -   **Streamed Events:** The agent guarantees the emission of the following event types:
-    -   `on_chat_model_stream`: Incremental LLM tokens during answer generation.
+    -   `on_chat_model_stream`: Incremental LLM tokens during a live answer generation.
+    -   `cached_response`: A single event containing the full, final answer when a response is served from the cache.
     -   `on_tool_start`: Notification that a tool (e.g., `retriever`) has been invoked, including its input arguments.
     -   `on_tool_end`: The raw output of a tool execution.
     -   `on_chain_end`: The final `AgentState` containing the complete message history and the `exit_reason`.
 -   **Event Ordering:** While `on_tool_start` will always precede `on_tool_end` for a given call, and `on_chain_end` is always the terminal event, the interleaved order of tokens and tool events is determined by the LLM's reasoning path.
--   **Caching Trade-off:** Cache hits for non-streaming LLM calls (see Section 8) **do not emit token-by-token streaming events**. Instead, they produce an immediate response followed by the final state. This is an intentional design decision to prioritize latency and determinism for repeated queries.
+-   **Caching Trade-off:** The streaming behavior is intentionally different for cached and live responses to balance performance and determinism.
+    -   Live LLM calls stream tokens for low perceived latency.
+    -   Cached responses emit a single event to avoid re-invoking the LLM, reducing cost and ensuring a fast, deterministic response.
 -   **Non-Guarantees:**
     -   **Token Granularity:** The size and frequency of chunks in `on_chat_model_stream` are not guaranteed and depend on the underlying provider.
     -   **Concurrency:** If multiple tool calls are triggered in parallel, their start/end events may interleave.
@@ -107,7 +112,7 @@ The agent provides two primary interfaces with distinct behavioral profiles.
 | Feature | `invoke` (Non-Streaming) | `astream_events` (Streaming) |
 | :--- | :--- | :--- |
 | **Primary Use Case** | Background tasks, batch processing, simple API responses. | Interactive UIs, real-time developer assistance. |
-| **Caching** | Fully supported for both retrieval and LLM calls. | LLM caching is supported but bypasses token events. |
+| **Caching** | Fully supported for both retrieval and LLM calls. | Fully supported. Cached LLM responses are delivered via a single `cached_response` event. |
 | **Latency** | Highest perceived (waits for full completion). | Lowest perceived (immediate feedback via tokens/events). |
 | **Termination Signal** | Function return. | Emission of the final state event. |
 
@@ -127,7 +132,10 @@ Downstream consumers (e.g., CLI, API, UI) must adhere to the following contract.
 
 -   **Rely On `exit_reason`:** The `exit_reason` field is the authoritative source for understanding the agent's termination status. Use it to determine if the request completed successfully, failed, or hit a limit.
 -   **Termination in Streaming:** When using `astream_events`, clients **must not** assume the last received token indicates completion. The only authoritative signal for termination is the emission of the final `AgentState` in the terminal event.
--   **Handling Cached Responses:** Clients must be designed to handle "instant" responses. If a query hits the LLM cache, the client will receive the final state without a preceding stream of tokens. UI layers should transition gracefully from a "thinking" state to the final answer in these cases.
+-   **Handling Streaming and Cached Responses:** Clients must be designed to handle both live-streamed tokens and full cached responses.
+    -   Listen for `on_chat_model_stream` events for live, incremental updates.
+    -   Listen for `cached_response` events for single-shot delivery of a cached answer.
+    By handling both, the UI can present the assistant's answer seamlessly, regardless of its source.
 -   **Display the Final Message:** The content of the final message in the `messages` list is intended for user display. In cases like `MAX_TURNS_REACHED` and `MAX_CONTEXT_REACHED`, this message is a canned response that should be shown verbatim.
 -   **Handle Retryable Exits:** For `RATE_LIMITED`, the client should implement a backoff-and-retry strategy. For other retryable exits, the client should inform the user they can try again, possibly with a modified prompt.
 -   **Do Not Assume a Definitive Answer:** The agent may validly respond that it does not have the information. Clients should be prepared to handle this "I don't know" state gracefully.

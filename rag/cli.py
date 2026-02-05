@@ -24,6 +24,9 @@ async def main():
             async for event in stream_agent(q):
                 if event["type"] == "token":
                     print(event["content"], end="", flush=True)
+                elif event["type"] == "cached_response":
+                    # Handle the unified event for cached messages
+                    print(event["content"], end="", flush=True)
                 elif event["type"] == "tool_start":
                     print(
                         f"\n[Calling tool: {event['name']} with input: {event['input']}]"
@@ -39,10 +42,6 @@ async def main():
                 # If there's a final state, check for messages and an exit reason.
                 if "messages" in final_state and final_state["messages"]:
                     final_state["messages"][-1]
-                    # Assuming AIMessage has a 'content' attribute.
-                    # The streaming part should have already printed the content.
-                    # This part might be redundant if the last message is the full response.
-                    # We will keep the exit reason print.
                 print(f"\n\n[exit_reason={final_state.get('exit_reason')}]")
             else:
                 print("\n[Error: No final state received]")
