@@ -7,10 +7,9 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, TypeVar
 
+from config import MAX_CONTEXT_CHARS
 from langchain_core.messages import BaseMessage
 from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
-
-from config import MAX_CONTEXT_CHARS
 
 T = TypeVar("T")
 
@@ -26,6 +25,14 @@ class BaseCache(ABC):
     async def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
         pass
 
+    @abstractmethod
+    def get_sync(self, key: str) -> Optional[Any]:
+        pass
+
+    @abstractmethod
+    def set_sync(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
+        pass
+
 
 class InMemoryCache(BaseCache):
     """Simple in-memory cache with TTL support."""
@@ -33,7 +40,7 @@ class InMemoryCache(BaseCache):
     def __init__(self):
         self._cache: Dict[str, tuple[Any, float]] = {}
 
-    async def get(self, key: str) -> Optional[Any]:
+    def get_sync(self, key: str) -> Optional[Any]:
         if key not in self._cache:
             return None
         value, expiry = self._cache[key]
@@ -42,9 +49,15 @@ class InMemoryCache(BaseCache):
             return None
         return value
 
-    async def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
+    def set_sync(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
         expiry = time.time() + ttl if ttl is not None else None
         self._cache[key] = (value, expiry)
+
+    async def get(self, key: str) -> Optional[Any]:
+        return self.get_sync(key)
+
+    async def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
+        self.set_sync(key, value, ttl)
 
 
 def generate_cache_key(prefix: str, data: Dict[str, Any]) -> str:
@@ -52,6 +65,36 @@ def generate_cache_key(prefix: str, data: Dict[str, Any]) -> str:
     serialized = json.dumps(data, sort_keys=True)
     hash_val = hashlib.sha256(serialized.encode()).hexdigest()
     return f"{prefix}:{hash_val}"
+
+
+def with_retry_sync(
+    func: Callable[..., T],
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 10.0,
+    retryable_exceptions: tuple[type[Exception], ...] = (Exception,),
+) -> T:
+    """
+    Executes a function with exponential backoff and jitter for transient failures.
+    Synchronous version.
+    """
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except retryable_exceptions as e:
+            last_exception = e
+            if attempt == max_retries - 1:
+                break
+
+            delay = min(max_delay, base_delay * (2**attempt))
+            jitter = random.uniform(0, 0.1 * delay)
+            time.sleep(delay + jitter)
+
+    if last_exception:
+        raise last_exception
+    raise RuntimeError("Retry failed without exception")
 
 
 async def with_retry(
@@ -63,7 +106,7 @@ async def with_retry(
 ):
     """
     Executes a function with exponential backoff and jitter for transient failures.
-    Supports both sync and async callables.
+    Supports both sync and async callables but MUST be awaited.
     """
     last_exception = None
 
@@ -90,7 +133,9 @@ async def with_retry(
             jitter = random.uniform(0, 0.1 * delay)
             await asyncio.sleep(delay + jitter)
 
-    raise last_exception
+    if last_exception:
+        raise last_exception
+    raise RuntimeError("Retry failed without exception")
 
 
 def trim_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
