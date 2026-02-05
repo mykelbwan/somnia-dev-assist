@@ -4,7 +4,3 @@ db
 __pycache__
 RUN_COMMAND.md
 codebook.toml
-api/
-README.md
-requirements.txt
-main.py
