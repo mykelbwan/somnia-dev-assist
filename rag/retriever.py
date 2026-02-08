@@ -4,8 +4,16 @@ from langchain_core.tools import tool
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from settings import GEMINI_API_KEY, Collection_Name, DB_Dir
 
+"""Commented out code cause the model is not available on my api key as i am not subscribed"""
+# _embeddings = GoogleGenerativeAIEmbeddings(
+#     model="models/text-embedding-004",
+#     api_key=GEMINI_API_KEY,
+#     task_type="retrieval_document",  # Helps the model understand this is for storage
+#     request_options={"timeout": 60},  # increase timeout
+# )
+
 _embeddings = GoogleGenerativeAIEmbeddings(
-    model="models/text-embedding-004", api_key=GEMINI_API_KEY
+    model="models/gemini-embedding-001", api_key=GEMINI_API_KEY
 )
 
 _vector_store = Chroma(
