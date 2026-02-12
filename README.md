@@ -47,6 +47,11 @@ This separation of concerns ensures that the agent's logic can be developed and 
 
 The original CLI functionality remains intact. You can run it to interact with the agent directly from your terminal.
 
+first ingest the documents via this command:
+```bash
+uv run rag/ingest.py
+```
+
 - **Non Streaming.**
 ```bash
 uv run rag/cli.py
